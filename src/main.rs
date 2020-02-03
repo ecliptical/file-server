@@ -5,11 +5,22 @@ use base64::{
 };
 
 use bytes::BytesMut;
-use file_server::built_info;
+use file_server::{
+    built_info,
+    tls::{
+        self,
+        HyperAcceptor,
+    },
+};
+
 use futures::{
-    future::FutureExt,
-    select,
-    stream::TryStreamExt,
+    future,
+    future::Either,
+    stream::{
+        SelectAll,
+        StreamExt,
+        TryStreamExt,
+    },
 };
 
 use headers::HeaderMapExt;
@@ -20,6 +31,7 @@ use hyper::{
         HeaderMap,
         HeaderValue,
     },
+    server::accept::from_stream,
     service::{
         make_service_fn,
         service_fn,
@@ -38,14 +50,17 @@ use mime_guess::{
     mime,
 };
 
+use rustls;
 use std::{
     hash::Hasher,
+    io,
     io::SeekFrom,
     net::SocketAddr,
     path::{
         Path,
         PathBuf,
     },
+    sync::Arc,
 };
 
 use structopt::StructOpt;
@@ -58,6 +73,8 @@ use tokio::{
     },
 };
 
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 use tokio_util::codec::{
     BytesCodec,
     Decoder,
@@ -76,6 +93,10 @@ struct Opt {
     /// Sets the TCP address to listen on
     #[structopt(long, env = "LISTEN_ADDR", default_value = "0.0.0.0:8080")]
     listen_addr: SocketAddr,
+
+    /// Sets the path to PEM file with SSL certificate and RSA key
+    #[structopt(long, env = "SSL_CERT")]
+    ssl: Option<PathBuf>,
 
     /// Sets the directory path
     #[structopt(default_value = ".", parse(from_os_str))]
@@ -263,6 +284,8 @@ async fn digest(mut file: &mut File) -> Result<String> {
 }
 
 fn main() -> Result<()> {
+    pretty_env_logger::init();
+
     let opt = Opt::from_args();
 
     if opt.version {
@@ -289,47 +312,108 @@ fn main() -> Result<()> {
             std::process::exit(1);
         });
 
-    pretty_env_logger::init();
+    let mut tls_acceptor = None;
+    if let Some(ref cert_path) = opt.ssl {
+        let certs = tls::load_certs(cert_path)?;
+        let key = tls::load_private_key(cert_path)?;
+        // Do not use client certificate authentication.
+        let mut cfg = rustls::ServerConfig::new(rustls::NoClientAuth::new());
+        // Select a certificate to use.
+        cfg.set_single_cert(certs, key)?;
+        // Configure ALPN to accept HTTP/2, HTTP/1.1 in that order.
+        cfg.set_protocols(&[b"h2".to_vec(), b"http/1.1".to_vec()]);
+        tls_acceptor = Some(TlsAcceptor::from(Arc::new(cfg)));
+    }
 
     info!("{}", version());
 
-    let make_service = make_service_fn(|_| {
-        let dir = dir.clone();
-        let ext = opt.ext.clone();
-        let cc = opt.cache_control.clone();
-        async {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                let dir = dir.clone();
-                let ext = ext.clone();
-                let cc = cc.clone();
-                async move { handle_request(req, &dir, ext, cc).await }
-            }))
-        }
-    });
-
     let shutdown_signal = async {
-        let mut sigint =
-            signal(SignalKind::interrupt()).expect("failed to register the interrupt signal");
-        let mut sigquit = signal(SignalKind::quit()).expect("failed to register the quit signal");
-        let mut sigterm =
-            signal(SignalKind::terminate()).expect("failed to register the terminate signal");
+        let mut signals = SelectAll::new();
+        signals.push(
+            signal(SignalKind::interrupt()).expect("failed to register the interrupt signal"),
+        );
+        signals.push(signal(SignalKind::quit()).expect("failed to register the quit signal"));
+        signals.push(
+            signal(SignalKind::terminate()).expect("failed to register the terminate signal"),
+        );
         // ignore SIGPIPE
         let _ = signal(SignalKind::pipe()).expect("failed to register the pipe signal");
 
-        select! {
-            _ = sigint.recv().fuse() => (),
-            _ = sigquit.recv().fuse() => (),
-            _ = sigterm.recv().fuse() => (),
-        }
+        signals.select_next_some().await
     };
 
     let mut rt = Runtime::new()?;
 
     rt.block_on(async {
-        let server = Server::bind(&opt.listen_addr)
-            .tcp_nodelay(true)
+        let mut tcp = TcpListener::bind(&opt.listen_addr).await?;
+        let incoming = tcp.incoming();
+        let server = if tls_acceptor.is_some() {
+            let incoming_tls_stream = incoming
+                .then(|r| async {
+                    match r {
+                        Ok(s) => {
+                            s.set_nodelay(true)?;
+                            tls_acceptor.clone().unwrap().accept(s).await
+                        }
+                        Err(e) => Err(e),
+                    }
+                })
+                .filter(|r| match r {
+                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                        debug!("accept error: {}", e);
+                        future::ready(false)
+                    }
+
+                    _ => future::ready(true),
+                })
+                .boxed();
+
+            let make_service = make_service_fn(|_| {
+                let dir = dir.clone();
+                let ext = opt.ext.clone();
+                let cc = opt.cache_control.clone();
+                async {
+                    Ok::<_, hyper::Error>(service_fn(move |req| {
+                        let dir = dir.clone();
+                        let ext = ext.clone();
+                        let cc = cc.clone();
+                        async move { handle_request(req, &dir, ext, cc).await }
+                    }))
+                }
+            });
+
+            let server = Server::builder(HyperAcceptor::new(incoming_tls_stream))
+                .serve(make_service)
+                .with_graceful_shutdown(shutdown_signal);
+
+            Either::Left(server)
+        } else {
+            let make_service = make_service_fn(|_| {
+                let dir = dir.clone();
+                let ext = opt.ext.clone();
+                let cc = opt.cache_control.clone();
+                async {
+                    Ok::<_, hyper::Error>(service_fn(move |req| {
+                        let dir = dir.clone();
+                        let ext = ext.clone();
+                        let cc = cc.clone();
+                        async move { handle_request(req, &dir, ext, cc).await }
+                    }))
+                }
+            });
+
+            let server = Server::builder(from_stream(incoming.map(|r| {
+                if let Ok(ref s) = r {
+                    s.set_nodelay(true)?;
+                }
+
+                r
+            })))
             .serve(make_service)
             .with_graceful_shutdown(shutdown_signal);
+
+            Either::Right(server)
+        };
 
         info!("listening on {}", opt.listen_addr);
         info!("serving files from {}", dir.to_string_lossy());

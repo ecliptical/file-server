@@ -1,7 +1,7 @@
 [package]
 name = "file-server"
 description = "Simple HTTP file server with support for conditional retrieval."
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Peter Nehrer <pnehrer@eclipticalsoftware.com>"]
 edition = "2018"
 
@@ -14,11 +14,13 @@ headers = "0.3"
 hyper = "0.13"
 log = { version = "0.4", features = ["std"] }
 mime_guess = "2.0"
-pretty_env_logger = "0.3"
+pretty_env_logger = "0.4"
+rustls = "0.16"
 structopt = "0.3"
-tokio = { version = "0.2", features = ["fs", "signal"] }
+tokio = { version = "0.2", features = ["full"] }
+tokio-rustls = "0.12"
 tokio-util = { version = "0.2", features = ["codec"] }
 twox-hash = "1.5"
 
 [build-dependencies]
-built = "0.3"
+built = { version = "0.4", features = ["chrono", "git2"] }
